@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 # Defaultwerte für interaktive Eingaben
 DEFAULT_N_CELLS = 20          # Default für Nx, Ny, Nz
+DEFAULT_STRUT_MM = 0.0        # Default-Strebendicke (0 = keine Überlappung)
 
 # Verzeichnisse
 CELL_TYPES_DIR = "cell_types"
@@ -22,8 +23,10 @@ BLENDER_EXE = r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"
 BLENDER_BOOL_SCRIPT = "blender_boolean_union.py"  # liegt im gleichen Ordner wie dieses Script
 
 # Optionen
-REMOVE_INTERNAL_INTERFACES = True   # interne Kontaktflächen zwischen Zellen entfernen
-DEDUPLICATE_TRIANGLES = False       # echte doppelte Dreiecke entfernen (meist wenig Effekt, kann viel RAM ziehen)
+# interne Kontaktflächen auf Kachel-Ebenen entfernen (sinnvoll v.a. bei 0-Überlappung)
+REMOVE_INTERNAL_INTERFACES = True
+# echte doppelte Dreiecke entfernen (meist wenig Effekt, kann viel RAM ziehen)
+DEDUPLICATE_TRIANGLES = False
 
 
 # =====================================================
@@ -165,9 +168,12 @@ def normalize_to_origin(triangles):
     sy = maxy - miny
     sz = maxz - minz
 
-    if sx == 0: sx = 1e-6
-    if sy == 0: sy = 1e-6
-    if sz == 0: sz = 1e-6
+    if sx == 0:
+        sx = 1e-6
+    if sy == 0:
+        sy = 1e-6
+    if sz == 0:
+        sz = 1e-6
 
     normalized = [translate_triangle(tri, -minx, -miny, -minz)
                   for tri in triangles]
@@ -175,11 +181,14 @@ def normalize_to_origin(triangles):
     return normalized, (sx, sy, sz)
 
 
-def tile_cell(triangles, cell_size, nx, ny, nz):
+def tile_cell(triangles, step, nx, ny, nz):
     """
     Kachelt die normalisierte Zelle nx * ny * nz mal in x,y,z-Richtung.
+
+    step: (step_x, step_y, step_z) Abstand zwischen Zellursprüngen
+          -> bei step_x < Zellkantenlänge entsteht eine Überlappung.
     """
-    sx, sy, sz = cell_size
+    step_x, step_y, step_z = step
     tiled = []
 
     total_cells = nx * ny * nz
@@ -190,9 +199,9 @@ def tile_cell(triangles, cell_size, nx, ny, nz):
         iy = (idx // nz) % ny
         iz = idx % nz
 
-        dx = ix * sx
-        dy = iy * sy
-        dz = iz * sz
+        dx = ix * step_x
+        dy = iy * step_y
+        dz = iz * step_z
 
         for tri in triangles:
             tiled.append(translate_triangle(tri, dx, dy, dz))
@@ -200,24 +209,31 @@ def tile_cell(triangles, cell_size, nx, ny, nz):
     return tiled
 
 
-def remove_internal_interface_faces(triangles, cell_size, nx, ny, nz, tol=1e-5):
+def remove_internal_interface_faces(triangles, step, nx, ny, nz, tol=1e-5):
     """
     Entfernt Dreiecke, die exakt auf internen Kachel-Ebenen liegen:
-      x = k*sx (1..nx-1), y = k*sy (1..ny-1), z = k*sz (1..nz-1)
-    -> Das sind die Kontaktflächen zwischen benachbarten Zellen.
-    Außenflächen (x=0, x=nx*sx usw.) bleiben erhalten.
+
+      x = k*step_x (1..nx-1),
+      y = k*step_y (1..ny-1),
+      z = k*step_z (1..nz-1)
+
+    -> Das sind Kontaktflächen zwischen Zellen für den Fall
+       Kante-an-Kante (kein Überlapp). Bei Überlappung lassen wir
+       diese Funktion normalerweise aus.
     """
     print()
     print(FG_WHITE + "Entferne interne Kontaktflächen zwischen Zellen..." + RESET)
 
-    sx, sy, sz = cell_size
+    step_x, step_y, step_z = step
 
-    def on_internal_plane(coords, step, count):
-        k_float = coords[0] / step
+    def on_internal_plane(coords, step_val, count):
+        if count <= 1:
+            return False
+        k_float = coords[0] / step_val
         k = round(k_float)
         if k <= 0 or k >= count:
             return False
-        plane = k * step
+        plane = k * step_val
         return all(abs(c - plane) < tol for c in coords)
 
     kept = []
@@ -230,11 +246,11 @@ def remove_internal_interface_faces(triangles, cell_size, nx, ny, nz, tol=1e-5):
 
         remove = False
 
-        if nx > 1 and on_internal_plane(xs, sx, nx):
+        if on_internal_plane(xs, step_x, nx):
             remove = True
-        elif ny > 1 and on_internal_plane(ys, sy, ny):
+        elif on_internal_plane(ys, step_y, ny):
             remove = True
-        elif nz > 1 and on_internal_plane(zs, sz, nz):
+        elif on_internal_plane(zs, step_z, nz):
             remove = True
 
         if remove:
@@ -392,14 +408,8 @@ def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) 
     """
     Startet Blender im Hintergrund und führt die Boolean-Union-Operation aus:
       result = lattice ∪ pads
-
-    Erwartet, dass 'blender_boolean_union.py' im selben Ordner
-    wie dieses Script liegt.
-    Schreibt die Blender-Konsole zusätzlich in eine Logdatei, um
-    Fehler besser debuggen zu können.
     """
-    # --- Pfade robust bestimmen ---
-    script_dir = os.path.dirname(os.path.abspath(__file__))  # Ordner von probe_creator.py
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     script_path = os.path.join(script_dir, BLENDER_BOOL_SCRIPT)
 
     if not os.path.exists(BLENDER_EXE):
@@ -409,7 +419,6 @@ def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) 
 
     if not os.path.exists(script_path):
         print(FG_RED + f"Blender-Script '{BLENDER_BOOL_SCRIPT}' nicht gefunden." + RESET)
-        print(FG_RED + "Bitte im selben Ordner wie 'probe_creator.py' ablegen." + RESET)
         print(FG_RED + f"Gesuchter Pfad war: {script_path}" + RESET)
         return False
 
@@ -426,7 +435,6 @@ def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) 
     print()
     print(FG_CYAN + "Starte Blender für Boolean-Union (Lattice ∪ Pads)..." + RESET)
 
-    # Logfile im Export-Ordner
     export_dir = os.path.join(script_dir, EXPORT_DIR_NAME)
     os.makedirs(export_dir, exist_ok=True)
     log_path = os.path.join(export_dir, "blender_boolean_union.log")
@@ -435,7 +443,6 @@ def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) 
     start_time = time.time()
 
     try:
-        # Blender-Ausgabe in Logfile schreiben, damit wir sie bei Fehlern lesen können
         log_file = open(log_path, "wb")
         proc = subprocess.Popen(
             cmd,
@@ -443,14 +450,10 @@ def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) 
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
         )
-    except FileNotFoundError:
-        print(FG_RED + "Blender konnte nicht gestartet werden. Pfad prüfen." + RESET)
-        return False
     except Exception as e:
         print(FG_RED + f"Fehler beim Starten von Blender: {e}" + RESET)
         return False
 
-    # Spinner anzeigen, solange Blender läuft
     while True:
         ret = proc.poll()
         if ret is not None:
@@ -463,33 +466,20 @@ def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) 
         )
         time.sleep(0.2)
 
-    # Logfile schließen, bevor wir es evtl. lesen
     log_file.close()
-    print()  # Zeilenumbruch nach dem Spinner
+    print()
 
     if proc.returncode != 0:
         print(FG_RED + f"Blender Boolean-Union fehlgeschlagen (Returncode {proc.returncode})." + RESET)
         print(FG_YELLOW + "Blender-Log findest du hier:" + RESET)
         print(FG_CYAN + log_path + RESET)
-
-        # Optional: letzte paar Zeilen direkt anzeigen
-        try:
-            with open(log_path, "r", encoding="utf-8", errors="ignore") as lf:
-                lines = lf.readlines()
-            tail = "".join(lines[-20:])  # letzte 20 Zeilen
-            print(FG_YELLOW + "Letzte Zeilen aus dem Blender-Log:" + RESET)
-            print(FG_WHITE + tail + RESET)
-        except Exception as e:
-            print(FG_YELLOW + f"(Konnte Log nicht lesen: {e})" + RESET)
-
         return False
 
-    # Erfolgspfad
     if not os.path.exists(output_stl):
         print(FG_RED + "Blender lief durch, aber die Output-STL existiert nicht!" + RESET)
-        print(FG_YELLOW + "Pfad, den wir erwartet haben:" + RESET)
+        print(FG_YELLOW + "Erwarteter Pfad:" + RESET)
         print(FG_CYAN + output_stl + RESET)
-        print(FG_YELLOW + "Blender-Log zur Analyse:" + RESET)
+        print(FG_YELLOW + "Blender-Log:" + RESET)
         print(FG_CYAN + log_path + RESET)
         return False
 
@@ -499,8 +489,8 @@ def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) 
     print(FG_GREEN + f"Boolean-Ergebnis geschrieben nach: {output_stl}" + RESET)
     print(FG_WHITE + f"  Dateigröße: {FG_CYAN}{size_bytes/1_000_000:.2f} MB" + RESET)
     print(FG_WHITE + f"  Blender-Log: {FG_CYAN}{log_path}{RESET}")
-
     return True
+
 
 # =====================================================
 # Interaktive Eingaben
@@ -521,13 +511,28 @@ def ask_int(prompt: str, default: int, min_value: int = 1) -> int:
             print(FG_YELLOW + "Bitte eine ganzzahlige Zahl eingeben." + RESET)
 
 
+def ask_float(prompt: str, default: float, min_value: float = 0.0) -> float:
+    while True:
+        s = input(f"{prompt} [{default}]: ").strip().replace(",", ".")
+        if s == "":
+            return default
+        try:
+            v = float(s)
+            if v < min_value:
+                print(FG_YELLOW + f"Wert muss >= {min_value} sein." + RESET)
+                continue
+            return v
+        except ValueError:
+            print(FG_YELLOW + "Bitte eine Zahl eingeben (z.B. 0.12)." + RESET)
+
+
 # =====================================================
 # Main
 # =====================================================
 
 def main():
     print(SEPARATOR)
-    print(FG_MAGENTA + BOLD + "  Lattice-Generator" + RESET)
+    print(FG_MAGENTA + BOLD + "  Lattice-Generator (direktes Tiling)" + RESET)
     print(SEPARATOR)
 
     # --- Zelltyp auswählen ---
@@ -539,7 +544,7 @@ def main():
     if not os.path.exists(input_stl):
         raise FileNotFoundError(f"Eingabedatei '{input_stl}' nicht gefunden.")
 
-    # --- Anzahl Zellen pro Richtung abfragen ---
+    # --- Anzahl Zellen pro Richtung ---
     print()
     print(SEPARATOR)
     print(FG_MAGENTA + BOLD + "  Anzahl der Zellen pro Richtung" + RESET)
@@ -560,13 +565,11 @@ def main():
     export_dir = os.path.join(os.getcwd(), EXPORT_DIR_NAME)
     os.makedirs(export_dir, exist_ok=True)
 
-    # Basisname für Dateien
+    # Basisname
     base_name = f"{cell_name}_{nx}x{ny}x{nz}"
     if pad_name is not None:
         safe_pad_name = pad_name.replace(" ", "-")
         base_name += f"_{safe_pad_name}"
-
-    # Finale Ausgabe
     final_output_stl = os.path.join(export_dir, base_name + ".stl")
 
     # --- Einzelzell-STL laden ---
@@ -581,19 +584,72 @@ def main():
     print(FG_WHITE + "Normalisiere Zelle auf Ursprung und ermittle Zellgröße..." + RESET)
     norm_triangles, cell_size = normalize_to_origin(base_triangles)
     sx, sy, sz = cell_size
-    print(FG_WHITE + f"  Zellgröße: {FG_CYAN}sx={sx:.3f} mm, sy={sy:.3f} mm, sz={sz:.3f} mm" + RESET)
+    print(FG_WHITE + f"  Zellgröße (Bounding Box): "
+          + FG_CYAN + f"sx={sx:.3f} mm, sy={sy:.3f} mm, sz={sz:.3f} mm" + RESET)
+
+    # --- Strebendicke abfragen (direkt als -Strebendicke Versatz) ---
+    print()
+    print(SEPARATOR)
+    print(FG_MAGENTA + BOLD + "  Strebendicke & STL-Skalierung" + RESET)
+    print(SEPARATOR)
+
+    # 1) Strebendicke in "realen" mm (wie du sie dir vorstellst)
+    strut_mm_user = ask_float(
+        FG_WHITE + "Strebendicke in mm:" + RESET,
+        DEFAULT_STRUT_MM,
+        min_value=0.0
+    )
+
+    # 2) Skalierungsfaktor zwischen user mm und der STL-Geometrie
+    #    1.0  -> STL ist im richtigen Maßstab
+    #    10.0 -> STL ist 10x größer als gedacht
+    #    0.1  -> STL ist 10x kleiner als gedacht (selten)
+    stl_scale = ask_float(
+        FG_WHITE + "Skalierungsfaktor der STL:" + RESET,
+        1.0,
+        min_value=0.0001
+    )
+
+    # Strebendicke, wie sie im STL tatsächlich erscheint
+    strut_mm_stl = strut_mm_user * stl_scale
+
+    if strut_mm_user <= 0.0:
+        # keine Überlappung -> Schritt = Zellkantenlänge
+        step_x, step_y, step_z = sx, sy, sz
+        print(FG_WHITE + "  Kante an Kante (keine Überlappung)." + RESET)
+        print(FG_WHITE + "  Kachel-Schrittweiten: " +
+              FG_CYAN + f"step_x={step_x:.3f}, step_y={step_y:.3f}, step_z={step_z:.3f} mm (STL-Raum)" + RESET)
+    else:
+        # Schritt = Zellkantenlänge - Strebendicke_im_STL
+        step_x = max(sx - strut_mm_stl, sx * 0.1)
+        step_y = max(sy - strut_mm_stl, sy * 0.1)
+        step_z = max(sz - strut_mm_stl, sz * 0.1)
+
+        if step_x != sx - strut_mm_stl or step_y != sy - strut_mm_stl or step_z != sz - strut_mm_stl:
+            print(FG_YELLOW +
+                  "Hinweis: Strebendicke*Skalierung war größer als 90% der Zellkante – "
+                  "Schrittweite wurde zur Sicherheit begrenzt." + RESET)
+
+        print(FG_WHITE + "  Eingestellte Strebendicke (real): " +
+              FG_CYAN + f"{strut_mm_user:.4f} mm" + RESET)
+        print(FG_WHITE + "  Strebendicke im STL-Maßstab:      " +
+              FG_CYAN + f"{strut_mm_stl:.4f} mm" + RESET)
+        print(FG_WHITE + "  Effektive Schrittweiten (Zellkante - Strebendicke_im_STL):" + RESET)
+        print(FG_CYAN + f"    step_x={step_x:.4f}, step_y={step_y:.4f}, step_z={step_z:.4f} mm (STL-Raum)" + RESET)
+
+    step = (step_x, step_y, step_z)
+
 
     # --- Tiling ---
     print()
     print(FG_WHITE + f"Erzeuge Gitter: {FG_CYAN}{nx} x {ny} x {nz}" + RESET)
-    lattice_triangles = tile_cell(norm_triangles, cell_size, nx, ny, nz)
+    lattice_triangles = tile_cell(norm_triangles, step, nx, ny, nz)
     print(FG_WHITE + "  -> Dreiecke nach Tiling: " +
           FG_CYAN + f"{len(lattice_triangles):,}" + RESET)
 
-    # --- interne Kontaktflächen entfernen (nur im Lattice) ---
-    if REMOVE_INTERNAL_INTERFACES:
+    if REMOVE_INTERNAL_INTERFACES and strut_mm_user == 0.0:
         lattice_triangles = remove_internal_interface_faces(
-            lattice_triangles, cell_size, nx, ny, nz, tol=1e-5
+            lattice_triangles, step, nx, ny, nz, tol=1e-5
         )
 
     # --- Duplikate entfernen (optional) ---
@@ -622,11 +678,9 @@ def main():
         print(FG_WHITE + f"Schreibe Lattice-only STL für Boolean-Union: {FG_CYAN}{lattice_only_path}{RESET}")
         write_binary_stl(lattice_triangles, lattice_only_path, base_name, show_progress=True)
 
-        # Boolean-Union: (Lattice-only) ∪ (Pad-STL) -> final_output_stl
         ok = run_blender_boolean_union(lattice_only_path, pad_stl, final_output_stl)
 
         if ok:
-            # Boolean erfolgreich -> Temp kann weg
             try:
                 os.remove(lattice_only_path)
                 print(FG_WHITE + "Temporäre Lattice-only STL gelöscht." + RESET)
@@ -637,7 +691,6 @@ def main():
             success = True
             reported_path = final_output_stl
         else:
-            # Boolean fehlgeschlagen -> Lattice-only als Fallback behalten
             print(FG_YELLOW + "Boolean-Union fehlgeschlagen – Lattice-only STL bleibt als Fallback erhalten." + RESET)
             print(FG_YELLOW + "Du findest das Lattice ohne Pads unter:" + RESET)
             print(FG_CYAN + lattice_only_path + RESET)
@@ -654,6 +707,7 @@ def main():
     else:
         print(FG_WHITE + "  Finale STL konnte NICHT erzeugt werden." + RESET)
     print(SEPARATOR)
+
 
 if __name__ == "__main__":
     main()
