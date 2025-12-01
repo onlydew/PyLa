@@ -51,6 +51,8 @@ FG_MAGENTA = "\033[35m"
 FG_CYAN = "\033[36m"
 FG_WHITE = "\033[97m"
 
+FG_DIM = "\033[90m"
+
 SEPARATOR = FG_BLUE + "-" * 72 + RESET
 
 
@@ -147,16 +149,11 @@ def write_binary_stl(triangles, path, solid_name="mesh", show_progress=True):
 
 def choose_variant_recursive(label: str, root_folder: str, allow_none: bool):
     """
-    Navigiert interaktiv durch root_folder (inkl. Unterordner),
-    bis eine konkrete STL-Datei gewählt wurde.
-
-    label      = Anzeigename (z.B. "Cell", "Pad")
-    root_folder= Wurzelordner (z.B. "cell_variants")
-    allow_none = ob eine 'Keine Auswahl'-Option existiert
-
-    Rückgabe: (chosen_name, chosen_path)
-              oder (None, None), wenn allow_none=True und '0' gewählt wurde
+    Interaktives Menü mit Pfeiltasten + Zahlen zur Auswahl einer STL-Datei.
+    Navigiert rekursiv durch Unterordner.
     """
+    import msvcrt
+
     print()
     print(SEPARATOR)
     print(FG_MAGENTA + BOLD + f"  {label}-Variante auswählen" + RESET)
@@ -167,98 +164,121 @@ def choose_variant_recursive(label: str, root_folder: str, allow_none: bool):
         if allow_none:
             print(FG_YELLOW + "Überspringe (keine Auswahl möglich)" + RESET)
             return None, None
-        raise RuntimeError(f"Ordner '{root_folder}' fehlt – für '{label}' erforderlich.")
+        raise RuntimeError(f"Ordner '{root_folder}' fehlt – erforderlich.")
 
     root_abs = os.path.abspath(root_folder)
     current_dir = root_abs
+    selected_index = 0
 
     while True:
-        # Inhalte auflisten
+
+        # -------- Inhalte auflisten --------
         entries = os.listdir(current_dir)
-        subdirs = sorted(
-            d for d in entries
-            if os.path.isdir(os.path.join(current_dir, d))
-        )
-        stl_files = sorted(
-            f for f in entries
-            if f.lower().endswith(".stl")
-        )
+        subdirs = sorted([d for d in entries if os.path.isdir(os.path.join(current_dir, d))])
+        stl_files = sorted([f for f in entries if f.lower().endswith(".stl")])
 
-        rel_path = os.path.relpath(current_dir, root_abs)
-        if rel_path == ".":
-            rel_path = "."
+        items = [("dir", d) for d in subdirs] + [("file", f) for f in stl_files]
 
-        print()
-        print(FG_WHITE + "Aktueller Ordner: " + FG_CYAN + rel_path + RESET)
-        print()
-
-        options = {}
-        idx = 1
-
-        # Unterordner
-        for d in subdirs:
-            options[str(idx)] = ("dir", d)
-            print(f"  {FG_CYAN}{idx}{RESET}: [Ordner] {FG_WHITE}{d}{RESET}")
-            idx += 1
-
-        # STL-Dateien
-        for f in stl_files:
-            options[str(idx)] = ("file", f)
-            print(f"  {FG_CYAN}{idx}{RESET}: [STL]    {FG_WHITE}{f}{RESET}")
-            idx += 1
-
-        # Zurück-Option (nur wenn wir nicht im Root sind)
+        # Extra-Optionen
+        extra_items = []
         if current_dir != root_abs:
-            print(f"  {FG_CYAN}b{RESET}: Eine Ebene zurück")
-
-        # Keine-Auswahl-Option (falls erlaubt)
+            extra_items.append(("back", ".."))
         if allow_none:
-            print(f"  {FG_CYAN}0{RESET}: Keine Auswahl")
+            extra_items.append(("none", "Keine Auswahl"))
 
-        if not options and not (allow_none and current_dir == root_abs):
-            print(FG_YELLOW + "Keine Unterordner/STLs in diesem Ordner." + RESET)
-            if current_dir == root_abs:
-                # im Root und nichts drin → ggf. None
-                if allow_none:
-                    return None, None
-                else:
-                    raise RuntimeError(f"Keine STLs in '{root_folder}', aber '{label}' muss gewählt werden.")
+        all_items = items + extra_items
+
+        if not all_items:
+            print(FG_YELLOW + "Keine Inhalte – gehe eine Ebene zurück." + RESET)
+            current_dir = os.path.dirname(current_dir)
+            selected_index = 0
+            continue
+
+        if selected_index >= len(all_items):
+            selected_index = len(all_items) - 1
+
+        # -------- Anzeige --------
+        print("\033[2J\033[H", end="")  # Bildschirm löschen
+        print(FG_MAGENTA + BOLD + f"{label}-Variante auswählen" + RESET)
+        rel = os.path.relpath(current_dir, root_abs)
+        print(FG_WHITE + "Ordner: " + FG_CYAN + rel + RESET)
+        print()
+
+        # normale Items
+        for idx, (kind, name) in enumerate(items):
+            prefix = FG_CYAN + ">" + RESET if idx == selected_index else " "
+            if kind == "dir":
+                print(f"{prefix} [Ordner] {name}")
             else:
-                # ein Ordner höher
-                current_dir = os.path.dirname(current_dir)
-                continue
+                print(f"{prefix} [STL]    {name}")
+
+        # extra items
+        extra_start = len(items)
+        for i, (kind, name) in enumerate(extra_items):
+            idx = extra_start + i
+            prefix = FG_CYAN + ">" + RESET if idx == selected_index else " "
+            print(f"{prefix} {name}")
 
         print()
-        choice = input(FG_WHITE + "Deine Auswahl: " + RESET).strip()
+        print(FG_DIM + "↑/↓ bewegen | Enter auswählen | Zahl = direkte Auswahl | b = zurück" + RESET)
 
-        if choice == "" :
-            print(FG_YELLOW + "Bitte eine Auswahl treffen." + RESET)
-            continue
+        # -------- Eingabe lesen --------
+        ch = msvcrt.getch()
 
-        # Keine Auswahl
-        if allow_none and choice == "0":
-            return None, None
-
-        # Eine Ebene zurück
-        if choice.lower() == "b":
-            if current_dir == root_abs:
-                print(FG_YELLOW + "Bereits im Wurzelordner." + RESET)
-            else:
-                current_dir = os.path.dirname(current_dir)
-            continue
-
-        # Nummern-Auswahl
-        if choice in options:
-            kind, name = options[choice]
+        # ENTER
+        if ch in (b"\r", b"\n"):
+            kind, name = all_items[selected_index]
             if kind == "dir":
                 current_dir = os.path.join(current_dir, name)
+                selected_index = 0
                 continue
-            else:  # 'file'
+            elif kind == "file":
                 full_path = os.path.join(current_dir, name)
                 base_name = os.path.splitext(name)[0]
                 return base_name, full_path
+            elif kind == "back":
+                current_dir = os.path.dirname(current_dir)
+                selected_index = 0
+                continue
+            elif kind == "none":
+                return None, None
 
-        print(FG_YELLOW + "Ungültige Auswahl. Bitte erneut versuchen." + RESET)
+        # Pfeiltasten
+        elif ch in (b"\x00", b"\xe0"):
+            ch2 = msvcrt.getch()
+            if ch2 == b"H":  # ↑
+                selected_index = (selected_index - 1) % len(all_items)
+            elif ch2 == b"P":  # ↓
+                selected_index = (selected_index + 1) % len(all_items)
+
+        # Zahleneingabe
+        elif ch.isdigit():
+            digit = int(ch.decode())
+            # 0 = keine Auswahl (wenn erlaubt)
+            if digit == 0 and allow_none:
+                return None, None
+            # 1..n normale Items
+            if 1 <= digit <= len(items):
+                kind, name = items[digit - 1]
+                if kind == "dir":
+                    current_dir = os.path.join(current_dir, name)
+                    selected_index = 0
+                    continue
+                else:
+                    full_path = os.path.join(current_dir, name)
+                    base_name = os.path.splitext(name)[0]
+                    return base_name, full_path
+
+        # „b“ für back
+        elif ch.lower() == b"b":
+            if current_dir == root_abs:
+                continue
+            current_dir = os.path.dirname(current_dir)
+            selected_index = 0
+
+        # andere Eingaben ignorieren
+        else:
+            pass
 
 # =====================================================
 # Geometrie-Hilfsfunktionen
