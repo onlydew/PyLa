@@ -14,9 +14,15 @@ DEFAULT_N_CELLS = 20          # Default für Nx, Ny, Nz
 DEFAULT_STRUT_MM = 0.0        # Default-Strebendicke (0 = keine Überlappung)
 
 # Verzeichnisse
-CELL_TYPES_DIR = "cell_types"
-PAD_TYPES_DIR = "pad_types"
 EXPORT_DIR_NAME = "export"
+VARIANT_FOLDERS = [
+    ("cell", "cell_variants", False),      # (Label, Ordner, allow_none?)
+    ("pad",  "pad_variants", True),
+    ("hook", "hook_variants", True),
+    ("temp", "temp_variants", True),
+    ("bed",  "bed_variants", True),
+]
+
 
 # Blender (für Boolean-Union Pads)
 BLENDER_EXE = r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"
@@ -139,6 +145,120 @@ def write_binary_stl(triangles, path, solid_name="mesh", show_progress=True):
             )
             f.write(data)
 
+def choose_variant_recursive(label: str, root_folder: str, allow_none: bool):
+    """
+    Navigiert interaktiv durch root_folder (inkl. Unterordner),
+    bis eine konkrete STL-Datei gewählt wurde.
+
+    label      = Anzeigename (z.B. "Cell", "Pad")
+    root_folder= Wurzelordner (z.B. "cell_variants")
+    allow_none = ob eine 'Keine Auswahl'-Option existiert
+
+    Rückgabe: (chosen_name, chosen_path)
+              oder (None, None), wenn allow_none=True und '0' gewählt wurde
+    """
+    print()
+    print(SEPARATOR)
+    print(FG_MAGENTA + BOLD + f"  {label}-Variante auswählen" + RESET)
+    print(SEPARATOR)
+
+    if not os.path.isdir(root_folder):
+        print(FG_RED + f"Ordner '{root_folder}' existiert nicht!" + RESET)
+        if allow_none:
+            print(FG_YELLOW + "Überspringe (keine Auswahl möglich)" + RESET)
+            return None, None
+        raise RuntimeError(f"Ordner '{root_folder}' fehlt – für '{label}' erforderlich.")
+
+    root_abs = os.path.abspath(root_folder)
+    current_dir = root_abs
+
+    while True:
+        # Inhalte auflisten
+        entries = os.listdir(current_dir)
+        subdirs = sorted(
+            d for d in entries
+            if os.path.isdir(os.path.join(current_dir, d))
+        )
+        stl_files = sorted(
+            f for f in entries
+            if f.lower().endswith(".stl")
+        )
+
+        rel_path = os.path.relpath(current_dir, root_abs)
+        if rel_path == ".":
+            rel_path = "."
+
+        print()
+        print(FG_WHITE + "Aktueller Ordner: " + FG_CYAN + rel_path + RESET)
+        print()
+
+        options = {}
+        idx = 1
+
+        # Unterordner
+        for d in subdirs:
+            options[str(idx)] = ("dir", d)
+            print(f"  {FG_CYAN}{idx}{RESET}: [Ordner] {FG_WHITE}{d}{RESET}")
+            idx += 1
+
+        # STL-Dateien
+        for f in stl_files:
+            options[str(idx)] = ("file", f)
+            print(f"  {FG_CYAN}{idx}{RESET}: [STL]    {FG_WHITE}{f}{RESET}")
+            idx += 1
+
+        # Zurück-Option (nur wenn wir nicht im Root sind)
+        if current_dir != root_abs:
+            print(f"  {FG_CYAN}b{RESET}: Eine Ebene zurück")
+
+        # Keine-Auswahl-Option (falls erlaubt)
+        if allow_none:
+            print(f"  {FG_CYAN}0{RESET}: Keine Auswahl")
+
+        if not options and not (allow_none and current_dir == root_abs):
+            print(FG_YELLOW + "Keine Unterordner/STLs in diesem Ordner." + RESET)
+            if current_dir == root_abs:
+                # im Root und nichts drin → ggf. None
+                if allow_none:
+                    return None, None
+                else:
+                    raise RuntimeError(f"Keine STLs in '{root_folder}', aber '{label}' muss gewählt werden.")
+            else:
+                # ein Ordner höher
+                current_dir = os.path.dirname(current_dir)
+                continue
+
+        print()
+        choice = input(FG_WHITE + "Deine Auswahl: " + RESET).strip()
+
+        if choice == "" :
+            print(FG_YELLOW + "Bitte eine Auswahl treffen." + RESET)
+            continue
+
+        # Keine Auswahl
+        if allow_none and choice == "0":
+            return None, None
+
+        # Eine Ebene zurück
+        if choice.lower() == "b":
+            if current_dir == root_abs:
+                print(FG_YELLOW + "Bereits im Wurzelordner." + RESET)
+            else:
+                current_dir = os.path.dirname(current_dir)
+            continue
+
+        # Nummern-Auswahl
+        if choice in options:
+            kind, name = options[choice]
+            if kind == "dir":
+                current_dir = os.path.join(current_dir, name)
+                continue
+            else:  # 'file'
+                full_path = os.path.join(current_dir, name)
+                base_name = os.path.splitext(name)[0]
+                return base_name, full_path
+
+        print(FG_YELLOW + "Ungültige Auswahl. Bitte erneut versuchen." + RESET)
 
 # =====================================================
 # Geometrie-Hilfsfunktionen
@@ -535,16 +655,51 @@ def main():
     print(FG_MAGENTA + BOLD + "  Lattice-Generator (direktes Tiling)" + RESET)
     print(SEPARATOR)
 
-    # --- Zelltyp auswählen ---
-    cell_name, input_stl = choose_cell_type()
+    # ------------------------------------------------------------------
+    # 1) Varianten auswählen (Cell, Pad, Hook, Temp, Bed)
+    # ------------------------------------------------------------------
+    chosen_variants = {}       # label -> (name, path)
+    variant_name_parts = []    # für den finalen Dateinamen
+
+    for label, folder, allow_none in VARIANT_FOLDERS:
+        nice_label = label.capitalize()
+        name, path = choose_variant_recursive(nice_label, folder, allow_none)
+        chosen_variants[label] = (name, path)
+
+        if label == "cell":
+            if name is None or path is None:
+                raise RuntimeError("Es muss eine Cell-Variante gewählt werden.")
+            variant_name_parts.append(name)
+        else:
+            if name is None:
+                variant_name_parts.append(f"no{nice_label}")
+            else:
+                variant_name_parts.append(name)
+
+    # Kurzreferenzen
+    cell_name, cell_stl = chosen_variants["cell"]
+    pad_name,  pad_stl  = chosen_variants["pad"]
+    hook_name, hook_stl = chosen_variants["hook"]
+    temp_name, temp_stl = chosen_variants["temp"]
+    bed_name,  bed_stl  = chosen_variants["bed"]
+
     print()
-    print(FG_WHITE + "Verwende Zelltyp: " + FG_CYAN + cell_name + RESET)
-    print(FG_WHITE + "Einzelzell-STL:   " + FG_CYAN + input_stl + RESET)
+    print(FG_WHITE + "Verwende Cell-Variante: " + FG_CYAN + cell_name + RESET)
+    print(FG_WHITE + "Cell-STL:              " + FG_CYAN + cell_stl + RESET)
 
-    if not os.path.exists(input_stl):
-        raise FileNotFoundError(f"Eingabedatei '{input_stl}' nicht gefunden.")
+    # Hinweis zu den optionalen Varianten
+    print()
+    print(FG_WHITE + "Pad-Variante:   " + FG_CYAN + (pad_name  or "keine") + RESET)
+    print(FG_WHITE + "Hook-Variante:  " + FG_CYAN + (hook_name or "keine") + RESET)
+    print(FG_WHITE + "Temp-Variante:  " + FG_CYAN + (temp_name or "keine") + RESET)
+    print(FG_WHITE + "Bed-Variante:   " + FG_CYAN + (bed_name  or "keine") + RESET)
 
-    # --- Anzahl Zellen pro Richtung ---
+    if not os.path.exists(cell_stl):
+        raise FileNotFoundError(f"Eingabedatei '{cell_stl}' nicht gefunden.")
+
+    # ------------------------------------------------------------------
+    # 2) Anzahl Zellen pro Richtung
+    # ------------------------------------------------------------------
     print()
     print(SEPARATOR)
     print(FG_MAGENTA + BOLD + "  Anzahl der Zellen pro Richtung" + RESET)
@@ -554,28 +709,22 @@ def main():
     ny = ask_int(FG_WHITE + "Anzahl Zellen in Y" + RESET, DEFAULT_N_CELLS)
     nz = ask_int(FG_WHITE + "Anzahl Zellen in Z" + RESET, DEFAULT_N_CELLS)
 
-    # --- Pad auswählen (optional) ---
-    pad_name, pad_stl = choose_pad_type()
-    if pad_name is not None:
-        print()
-        print(FG_WHITE + "Verwende Pad-Typ: " + FG_CYAN + pad_name + RESET)
-        print(FG_WHITE + "Pad-STL:         " + FG_CYAN + pad_stl + RESET)
-
-    # Export-Ordner erstellen
+    # ------------------------------------------------------------------
+    # 3) Export-Ordner + Basisname
+    # ------------------------------------------------------------------
     export_dir = os.path.join(os.getcwd(), EXPORT_DIR_NAME)
     os.makedirs(export_dir, exist_ok=True)
 
-    # Basisname
-    base_name = f"{cell_name}_{nx}x{ny}x{nz}"
-    if pad_name is not None:
-        safe_pad_name = pad_name.replace(" ", "-")
-        base_name += f"_{safe_pad_name}"
+    variant_suffix = "_".join(variant_name_parts)
+    base_name = variant_suffix
     final_output_stl = os.path.join(export_dir, base_name + ".stl")
 
-    # --- Einzelzell-STL laden ---
+    # ------------------------------------------------------------------
+    # 4) Einzelzell-STL lesen
+    # ------------------------------------------------------------------
     print()
-    print(FG_WHITE + f"Lese Einzelzell-STL: {FG_CYAN}{input_stl}{RESET}")
-    base_triangles = read_stl_auto(input_stl)
+    print(FG_WHITE + f"Lese Cell-STL: {FG_CYAN}{cell_stl}{RESET}")
+    base_triangles = read_stl_auto(cell_stl)
     base_tri_count = len(base_triangles)
     print(FG_WHITE + "  -> Dreiecke geladen: " + FG_CYAN + f"{base_tri_count:,}" + RESET)
 
@@ -587,30 +736,29 @@ def main():
     print(FG_WHITE + f"  Zellgröße (Bounding Box): "
           + FG_CYAN + f"sx={sx:.3f} mm, sy={sy:.3f} mm, sz={sz:.3f} mm" + RESET)
 
-    # --- Strebendicke abfragen (direkt als -Strebendicke Versatz) ---
+    # ------------------------------------------------------------------
+    # 5) Strebendicke + STL-Skalierung -> Schrittweiten
+    # ------------------------------------------------------------------
     print()
     print(SEPARATOR)
     print(FG_MAGENTA + BOLD + "  Strebendicke & STL-Skalierung" + RESET)
     print(SEPARATOR)
 
-    # 1) Strebendicke in "realen" mm (wie du sie dir vorstellst)
+    # reale Strebendicke in mm
     strut_mm_user = ask_float(
         FG_WHITE + "Strebendicke in mm:" + RESET,
         DEFAULT_STRUT_MM,
         min_value=0.0
     )
 
-    # 2) Skalierungsfaktor zwischen user mm und der STL-Geometrie
-    #    1.0  -> STL ist im richtigen Maßstab
-    #    10.0 -> STL ist 10x größer als gedacht
-    #    0.1  -> STL ist 10x kleiner als gedacht (selten)
+    # STL-Skalierungsfaktor
     stl_scale = ask_float(
         FG_WHITE + "Skalierungsfaktor der STL:" + RESET,
         1.0,
         min_value=0.0001
     )
 
-    # Strebendicke, wie sie im STL tatsächlich erscheint
+    # Strebendicke im STL-Maßstab
     strut_mm_stl = strut_mm_user * stl_scale
 
     if strut_mm_user <= 0.0:
@@ -620,7 +768,7 @@ def main():
         print(FG_WHITE + "  Kachel-Schrittweiten: " +
               FG_CYAN + f"step_x={step_x:.3f}, step_y={step_y:.3f}, step_z={step_z:.3f} mm (STL-Raum)" + RESET)
     else:
-        # Schritt = Zellkantenlänge - Strebendicke_im_STL
+        # Schritt = Zellkante - Strebendicke_im_STL
         step_x = max(sx - strut_mm_stl, sx * 0.1)
         step_y = max(sy - strut_mm_stl, sy * 0.1)
         step_z = max(sz - strut_mm_stl, sz * 0.1)
@@ -639,28 +787,35 @@ def main():
 
     step = (step_x, step_y, step_z)
 
-
-    # --- Tiling ---
+    # ------------------------------------------------------------------
+    # 6) Tiling
+    # ------------------------------------------------------------------
     print()
     print(FG_WHITE + f"Erzeuge Gitter: {FG_CYAN}{nx} x {ny} x {nz}" + RESET)
     lattice_triangles = tile_cell(norm_triangles, step, nx, ny, nz)
     print(FG_WHITE + "  -> Dreiecke nach Tiling: " +
           FG_CYAN + f"{len(lattice_triangles):,}" + RESET)
 
+    # interne Kontaktflächen entfernen (nur sinnvoll bei strut_mm_user == 0)
     if REMOVE_INTERNAL_INTERFACES and strut_mm_user == 0.0:
         lattice_triangles = remove_internal_interface_faces(
             lattice_triangles, step, nx, ny, nz, tol=1e-5
         )
 
-    # --- Duplikate entfernen (optional) ---
+    # Duplikate entfernen (optional)
     if DEDUPLICATE_TRIANGLES:
         lattice_triangles = deduplicate_triangles(lattice_triangles, tol=1e-6)
 
-    # Erfolg / Pfad für Abschlussausgabe
+    # ------------------------------------------------------------------
+    # 7) Export / ggf. Boolean-Union mit Pad
+    #    (Hook/Temp/Bed werden aktuell nur im Dateinamen kodiert – wie
+    #     sie geometrisch kombiniert werden sollen, können wir später
+    #     noch definieren.)
+    # ------------------------------------------------------------------
     success = False
     reported_path = None
 
-    # --- Fall 1: keine Pads -> direkt final schreiben ---
+    # Fall 1: kein Pad -> direkt final schreiben
     if pad_name is None or pad_stl is None:
         print()
         print(FG_WHITE + f"Schreibe finales Binary-STL (ohne Pads): {FG_CYAN}{final_output_stl}{RESET}")
@@ -670,7 +825,7 @@ def main():
         success = True
         reported_path = final_output_stl
 
-    # --- Fall 2: mit Pads -> erst Lattice-only schreiben, dann Boolean in Blender ---
+    # Fall 2: mit Pad -> Lattice-only schreiben, dann Boolean in Blender
     else:
         lattice_only_path = os.path.join(export_dir, base_name + "_lattice_only_tmp.stl")
 
@@ -697,7 +852,9 @@ def main():
             success = False
             reported_path = lattice_only_path
 
-    # --- Abschluss ---
+    # ------------------------------------------------------------------
+    # 8) Abschluss
+    # ------------------------------------------------------------------
     print()
     print(SEPARATOR)
     print(FG_GREEN + BOLD + "  Alles fertig." + RESET)
@@ -707,7 +864,6 @@ def main():
     else:
         print(FG_WHITE + "  Finale STL konnte NICHT erzeugt werden." + RESET)
     print(SEPARATOR)
-
 
 if __name__ == "__main__":
     main()
