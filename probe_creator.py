@@ -25,7 +25,7 @@ VARIANT_FOLDERS = [
 
 
 # Blender (für Boolean-Union Pads)
-BLENDER_EXE = r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"
+BLENDER_EXE = r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe"
 BLENDER_BOOL_SCRIPT = "blender_boolean_operator.py"  # liegt im gleichen Ordner wie dieses Script
 
 # Optionen
