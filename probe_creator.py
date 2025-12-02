@@ -26,13 +26,13 @@ VARIANT_FOLDERS = [
 
 # Blender (für Boolean-Union Pads)
 BLENDER_EXE = r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"
-BLENDER_BOOL_SCRIPT = "blender_boolean_union.py"  # liegt im gleichen Ordner wie dieses Script
+BLENDER_BOOL_SCRIPT = "blender_boolean_operator.py"  # liegt im gleichen Ordner wie dieses Script
 
 # Optionen
 # interne Kontaktflächen auf Kachel-Ebenen entfernen (sinnvoll v.a. bei 0-Überlappung)
 REMOVE_INTERNAL_INTERFACES = True
 # echte doppelte Dreiecke entfernen (meist wenig Effekt, kann viel RAM ziehen)
-DEDUPLICATE_TRIANGLES = False
+DEDUPLICATE_TRIANGLES = True
 
 
 # =====================================================
@@ -146,6 +146,17 @@ def write_binary_stl(triangles, path, solid_name="mesh", show_progress=True):
                 0                               # Attribute Byte Count
             )
             f.write(data)
+
+def find_cut_stl(path: str):
+    """
+    Zu einer gegebenen STL (…/foo.stl) die passende CUT-Version
+    (…/foo_CUT.stl) suchen. Gibt Pfad zurück oder None.
+    """
+    root, ext = os.path.splitext(path)
+    cut_path = root + "_CUT" + ext
+    if os.path.exists(cut_path):
+        return cut_path
+    return None
 
 def choose_variant_recursive(label: str, root_folder: str, allow_none: bool):
     """
@@ -293,6 +304,16 @@ def compute_bounding_box(triangles):
             zs.append(z)
     return min(xs), max(xs), min(ys), max(ys), min(zs), max(zs)
 
+def scale_triangles(triangles, factor: float):
+    """
+    Skaliert alle Koordinaten eines Dreieck-Arrays um 'factor'.
+    """
+    if factor == 1.0:
+        return triangles
+    scaled = []
+    for tri in triangles:
+        scaled.append(tuple((x * factor, y * factor, z * factor) for (x, y, z) in tri))
+    return scaled
 
 def translate_triangle(tri, dx, dy, dz):
     return tuple((x + dx, y + dy, z + dz) for (x, y, z) in tri)
@@ -469,6 +490,7 @@ def discover_stl_types_from_folder(folder: str):
     stl_files = sorted(
         f for f in os.listdir(folder)
         if f.lower().endswith(".stl")
+        and "_cut.stl" not in f.lower()   # <-- CUT-Dateien ausblenden
     )
 
     types = {}
@@ -480,7 +502,6 @@ def discover_stl_types_from_folder(folder: str):
         idx += 1
 
     return types
-
 
 def choose_cell_type():
     print(SEPARATOR)
@@ -544,22 +565,15 @@ def choose_pad_type():
 # Blender Headless: Boolean Union (Lattice ∪ Pads)
 # =====================================================
 
-def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) -> bool:
-    """
-    Startet Blender im Hintergrund und führt die Boolean-Union-Operation aus:
-      result = lattice ∪ pads
-    """
+def run_blender_boolean(op, mesh_a, mesh_b, output_stl):
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    script_path = os.path.join(script_dir, BLENDER_BOOL_SCRIPT)
+    script_path = os.path.join(script_dir, "blender_boolean_operator.py")
 
     if not os.path.exists(BLENDER_EXE):
-        print(FG_YELLOW + "Blender-Exe nicht gefunden – Boolean-Union übersprungen." + RESET)
-        print(FG_YELLOW + "Pfad in BLENDER_EXE anpassen." + RESET)
+        print(FG_RED + "Blender-Exe nicht gefunden." + RESET)
         return False
-
     if not os.path.exists(script_path):
-        print(FG_RED + f"Blender-Script '{BLENDER_BOOL_SCRIPT}' nicht gefunden." + RESET)
-        print(FG_RED + f"Gesuchter Pfad war: {script_path}" + RESET)
+        print(FG_RED + f"Blender-Script '{script_path}' nicht gefunden." + RESET)
         return False
 
     cmd = [
@@ -567,70 +581,54 @@ def run_blender_boolean_union(lattice_stl: str, pads_stl: str, output_stl: str) 
         "-b",
         "-P", script_path,
         "--",
-        os.path.abspath(lattice_stl),
-        os.path.abspath(pads_stl),
+        op,                 # 'UNION' oder 'DIFFERENCE'
+        os.path.abspath(mesh_a),
+        os.path.abspath(mesh_b),
         os.path.abspath(output_stl),
     ]
 
-    print()
-    print(FG_CYAN + "Starte Blender für Boolean-Union (Lattice ∪ Pads)..." + RESET)
-
-    export_dir = os.path.join(script_dir, EXPORT_DIR_NAME)
-    os.makedirs(export_dir, exist_ok=True)
-    log_path = os.path.join(export_dir, "blender_boolean_union.log")
+    print(FG_CYAN + f"Starte Blender Boolean ({op})..." + RESET)
 
     spinner = itertools.cycle("-\\|/")
     start_time = time.time()
 
-    try:
-        log_file = open(log_path, "wb")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        print(FG_RED + f"Fehler beim Starten von Blender: {e}" + RESET)
-        return False
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+    )
 
+    # kleiner Spinner
     while True:
         ret = proc.poll()
         if ret is not None:
             break
         elapsed = time.time() - start_time
         print(
-            f"\r{FG_CYAN}Boolean-Union läuft... {next(spinner)}  {elapsed:5.1f}s{RESET}",
+            f"\r{FG_CYAN}Boolean {op} läuft... {next(spinner)}  {elapsed:5.1f}s{RESET}",
             end="",
             flush=True
         )
         time.sleep(0.2)
 
-    log_file.close()
-    print()
+    print()  # Zeilenumbruch
+
+    out = proc.stdout.read().decode("utf-8", errors="ignore") if proc.stdout else ""
+    log_path = os.path.join(os.path.dirname(output_stl), f"blender_{op.lower()}_log.txt")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(out)
 
     if proc.returncode != 0:
-        print(FG_RED + f"Blender Boolean-Union fehlgeschlagen (Returncode {proc.returncode})." + RESET)
-        print(FG_YELLOW + "Blender-Log findest du hier:" + RESET)
-        print(FG_CYAN + log_path + RESET)
+        print(FG_RED + f"Blender Boolean {op} fehlgeschlagen (Returncode {proc.returncode})." + RESET)
+        print(FG_YELLOW + "Letzte Zeilen aus dem Blender-Log:" + RESET)
+        print("\n".join(out.splitlines()[-20:]))
         return False
 
-    if not os.path.exists(output_stl):
-        print(FG_RED + "Blender lief durch, aber die Output-STL existiert nicht!" + RESET)
-        print(FG_YELLOW + "Erwarteter Pfad:" + RESET)
-        print(FG_CYAN + output_stl + RESET)
-        print(FG_YELLOW + "Blender-Log:" + RESET)
-        print(FG_CYAN + log_path + RESET)
-        return False
-
-    elapsed = time.time() - start_time
-    size_bytes = os.path.getsize(output_stl)
-    print(FG_GREEN + f"Boolean-Union fertig in {elapsed:5.1f}s." + RESET)
-    print(FG_GREEN + f"Boolean-Ergebnis geschrieben nach: {output_stl}" + RESET)
-    print(FG_WHITE + f"  Dateigröße: {FG_CYAN}{size_bytes/1_000_000:.2f} MB" + RESET)
-    print(FG_WHITE + f"  Blender-Log: {FG_CYAN}{log_path}{RESET}")
+    print(FG_GREEN + f"Boolean {op} erfolgreich." + RESET)
+    print(FG_WHITE + f"  Ausgabe: {FG_CYAN}{output_stl}{RESET}")
+    print(FG_WHITE + f"  Log:     {FG_CYAN}{log_path}{RESET}")
     return True
-
 
 # =====================================================
 # Interaktive Eingaben
@@ -771,7 +769,7 @@ def main():
         min_value=0.0
     )
 
-    # STL-Skalierungsfaktor
+    # STL-Skalierungsfaktor (z.B. 10.0, wenn Fusion 10x größer exportiert)
     stl_scale = ask_float(
         FG_WHITE + "Skalierungsfaktor der STL:" + RESET,
         1.0,
@@ -826,61 +824,114 @@ def main():
     if DEDUPLICATE_TRIANGLES:
         lattice_triangles = deduplicate_triangles(lattice_triangles, tol=1e-6)
 
-    # ------------------------------------------------------------------
-    # 7) Export / ggf. Boolean-Union mit Pad
-    #    (Hook/Temp/Bed werden aktuell nur im Dateinamen kodiert – wie
-    #     sie geometrisch kombiniert werden sollen, können wir später
-    #     noch definieren.)
+     # ------------------------------------------------------------------
+    # 7) Export / Boolean-Pipeline mit CUT-Unterstützung
     # ------------------------------------------------------------------
     success = False
     reported_path = None
+    temp_files = []
 
-    # Fall 1: kein Pad -> direkt final schreiben
-    if pad_name is None or pad_stl is None:
+    # Fall: es gibt überhaupt keine Zusatzgeometrie -> nur Lattice schreiben
+    if all(stl is None for (_, stl) in [
+        chosen_variants["pad"],
+        chosen_variants["hook"],
+        chosen_variants["temp"],
+        chosen_variants["bed"],
+    ]):
         print()
-        print(FG_WHITE + f"Schreibe finales Binary-STL (ohne Pads): {FG_CYAN}{final_output_stl}{RESET}")
+        print(FG_WHITE + f"Schreibe finales Binary-STL (nur Lattice): {FG_CYAN}{final_output_stl}{RESET}")
+        # ggf. noch skalieren, falls du stl_scale verwendest:
+        # scaled = scale_triangles(lattice_triangles, 1.0 / stl_scale)
+        # write_binary_stl(scaled, final_output_stl, base_name, show_progress=True)
         write_binary_stl(lattice_triangles, final_output_stl, base_name, show_progress=True)
         print(FG_GREEN + "STL-Export fertig." + RESET)
+        success = True
+        reported_path = final_output_stl
+
+    else:
+        # 1) Lattice-only STL schreiben (Zwischenschritt)
+        lattice_only_path = os.path.join(export_dir, base_name + "_step0_lattice.stl")
+        print()
+        print(FG_WHITE + f"Schreibe Lattice-only STL für Boolean-Pipeline: {FG_CYAN}{lattice_only_path}{RESET}")
+        write_binary_stl(lattice_triangles, lattice_only_path, base_name, show_progress=True)
+        temp_files.append(lattice_only_path)
+
+        current = lattice_only_path
+
+        # Reihenfolge der Varianten, für die Booleans laufen sollen
+        pipeline = [
+            ("pad",  pad_stl),
+            ("hook", hook_stl),
+            ("temp", temp_stl),
+            ("bed",  bed_stl),
+        ]
+
+        for label, stl_path in pipeline:
+            if stl_path is None:
+                continue
+
+            nice = label.capitalize()
+            print()
+            print(FG_CYAN + f"=== Boolean mit {nice} ===" + RESET)
+
+            # 1) CUT-Datei suchen (…_CUT.stl)
+            cut_path = find_cut_stl(stl_path)
+            if cut_path:
+                diff_out = os.path.join(export_dir, f"{base_name}_diff_{label}.stl")
+                print(FG_WHITE + f"  CUT gefunden: {FG_CYAN}{cut_path}{RESET}")
+                print(FG_WHITE + f"  Führe DIFFERENCE aus: current - CUT -> {diff_out}" + RESET)
+                ok = run_blender_boolean("DIFFERENCE", current, cut_path, diff_out)
+                if not ok:
+                    raise RuntimeError(f"Boolean DIFFERENCE mit {label} fehlgeschlagen.")
+                temp_files.append(diff_out)
+                current = diff_out
+
+            # 2) UNION mit der eigentlichen STL
+            union_out = os.path.join(export_dir, f"{base_name}_union_{label}.stl")
+            print(FG_WHITE + f"  Führe UNION aus: current ∪ {stl_path} -> {union_out}" + RESET)
+            ok = run_blender_boolean("UNION", current, stl_path, union_out)
+            if not ok:
+                raise RuntimeError(f"Boolean UNION mit {label} fehlgeschlagen.")
+            temp_files.append(union_out)
+            current = union_out
+
+        # Am Ende liegt das letzte Boolean-Ergebnis in `current`
+        final_boolean_stl = current
+
+        print()
+        print(FG_WHITE + "Übernehme finales Boolean-Ergebnis als Output-STL..." + RESET)
+        # Wenn du noch skalieren willst, hier STL einlesen + skaliert schreiben,
+        # ansonsten einfach Datei kopieren:
+        if final_boolean_stl != final_output_stl:
+            # einfache Kopie
+            import shutil
+            shutil.copy2(final_boolean_stl, final_output_stl)
 
         success = True
         reported_path = final_output_stl
 
-    # Fall 2: mit Pad -> Lattice-only schreiben, dann Boolean in Blender
-    else:
-        lattice_only_path = os.path.join(export_dir, base_name + "_lattice_only_tmp.stl")
-
-        print()
-        print(FG_WHITE + f"Schreibe Lattice-only STL für Boolean-Union: {FG_CYAN}{lattice_only_path}{RESET}")
-        write_binary_stl(lattice_triangles, lattice_only_path, base_name, show_progress=True)
-
-        ok = run_blender_boolean_union(lattice_only_path, pad_stl, final_output_stl)
-
-        if ok:
-            try:
-                os.remove(lattice_only_path)
-                print(FG_WHITE + "Temporäre Lattice-only STL gelöscht." + RESET)
-            except OSError as e:
-                print(FG_YELLOW + f"Konnte temporäre Lattice-only STL nicht löschen: {e}" + RESET)
-
-            print(FG_GREEN + "STL-Export (Lattice ∪ Pads) fertig." + RESET)
-            success = True
-            reported_path = final_output_stl
-        else:
-            print(FG_YELLOW + "Boolean-Union fehlgeschlagen – Lattice-only STL bleibt als Fallback erhalten." + RESET)
-            print(FG_YELLOW + "Du findest das Lattice ohne Pads unter:" + RESET)
-            print(FG_CYAN + lattice_only_path + RESET)
-            success = False
-            reported_path = lattice_only_path
+    # ------------------------------------------------------------------
+    # 8) temporäre Dateien aufräumen
+    # ------------------------------------------------------------------
+    print()
+    print(FG_WHITE + "Bereinige temporäre Dateien..." + RESET)
+    for path in set(temp_files):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                print(FG_DIM + f"  gelöscht: {path}" + RESET)
+        except OSError as e:
+            print(FG_YELLOW + f"  konnte {path} nicht löschen: {e}" + RESET)
 
     # ------------------------------------------------------------------
-    # 8) Abschluss
+    # 9) Abschluss
     # ------------------------------------------------------------------
     print()
     print(SEPARATOR)
     print(FG_GREEN + BOLD + "  Alles fertig." + RESET)
     print(SEPARATOR)
-    if reported_path is not None and os.path.exists(reported_path):
-        print(FG_WHITE + "  Ausgabe-STL: " + FG_CYAN + reported_path + RESET)
+    if os.path.exists(final_output_stl):
+        print(FG_WHITE + "  Ausgabe-STL: " + FG_CYAN + final_output_stl + RESET)
     else:
         print(FG_WHITE + "  Finale STL konnte NICHT erzeugt werden." + RESET)
     print(SEPARATOR)
